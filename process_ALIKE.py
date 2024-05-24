@@ -89,7 +89,7 @@ class SimpleTracker(object):
 class SuperColorPCSampling(object):
     def __init__(self) -> None:
         self.ckpt_path = '../checkpoint/carn.pth'
-        self.signal_dir = './dataset/data_hard/signal/'
+        self.signal_dir = './dataset/data_hard/signal_o/'
         self.range_dir  = './dataset/data_hard/range/'
         self.pcd_dir = './dataset/data_hard/pcd/'  
         self.output_dir = 'kp_hard_35_1000'
@@ -101,6 +101,9 @@ class SuperColorPCSampling(object):
         self.scores_th = 0.8           # 检测器分数阈值
         self.n_limit = 1500           # 被检测的最大关键点数
         self.group = 1
+        self.weights_path = './superpoint_v1.pth'
+        
+        
         self.device_gn = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -118,6 +121,12 @@ class SuperColorPCSampling(object):
                         scores_th=self.scores_th,
                         n_limit=self.n_limit)
         
+        
+        self.model_superpoint = SuperPointFrontend(weights_path=self.weights_path,
+                                    nms_dist=2,
+                                    conf_thresh=0.025,
+                                    nn_thresh=0.7,
+                                    cuda=True)
         # super resolution
         module = importlib.import_module("model.{}".format('carn'))
         self.net = module.Net(multi_scale=True, group=self.group)
@@ -240,7 +249,65 @@ class SuperColorPCSampling(object):
                     text_position = (bg_img.shape[1] - text_width - 10, text_height + 10)
                     cv2.putText(bg_img, "range",text_position, self.font, self.font_scale, colors[0], self.thickness, cv2.LINE_AA)
         return keypoints_coor
+    
+    
+    def keypoint_extractor_SP(self, img, model_SP, tracker, super_res=-1, save_plot=False, bg_img=np.array([]), colors=[]):
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        kpts_range, desc_range, heatmap = model_SP.run(img)             
 
+        keypoints, N_matches_1 = tracker.update(img, kpts_range, desc_range)
+        # print("Compare",N_matches_1,len(kpts_range))
+        # keypoints_coor = self.get_adjacent_coordinates_vectorized(keypoints)
+        keypoints_coor = copy.deepcopy(keypoints)
+        keypoints_coor = np.round(keypoints_coor).astype(int)
+
+        if super_res > 0:
+            keypoints_coor[:, 0] = keypoints_coor[:, 0] / super_res
+            keypoints_coor[:, 1] = keypoints_coor[:, 1] / super_res
+            keypoints_coor = np.round(keypoints_coor).astype(int)
+
+        if save_plot:
+            for pt in keypoints_coor:
+                    cv2.circle(bg_img, (pt[0], pt[1]), 1, colors[0], -1)  # 在ori_sgn_img上绘制关键点
+                    # (text_width, text_height), baseline = cv2.getTextSize("", font, font_scale, thickness)
+                    (text_width, text_height), _ = cv2.getTextSize("range", self.font, self.font_scale, self.thickness)
+                    text_position = (bg_img.shape[1] - text_width - 10, text_height + 10)
+                    cv2.putText(bg_img, "range",text_position, self.font, self.font_scale, colors[0], self.thickness, cv2.LINE_AA)
+        return keypoints_coor
+
+    
+    def get_nearby_points_efficient(self, keypoints, region_size=3):
+        """
+        获取每个关键点附近的点，去除重复的点（高效实现）。
+        
+        参数:
+        - keypoints: np.ndarray, 关键点坐标数据，形状为[N, 2]
+        - region_size: int, 区域大小（默认3，即3x3区域）
+        
+        返回:
+        - unique_points: np.ndarray, 去重后的所有点坐标，形状为[M, 2]
+        """
+        # 计算半径
+        radius = region_size // 2
+
+        # 生成3x3区域的偏移
+        offsets = np.arange(-radius, radius + 1)
+        grid_x, grid_y = np.meshgrid(offsets, offsets)
+        grid_offsets = np.stack([grid_x.ravel(), grid_y.ravel()], axis=1)
+
+        # 扩展关键点
+        keypoints_expanded = keypoints[:, np.newaxis, :]
+
+        # 计算所有临近点
+        nearby_points = keypoints_expanded + grid_offsets
+
+        # 重塑为二维数组
+        nearby_points = nearby_points.reshape(-1, 2)
+
+        # 去除重复点
+        unique_points = np.unique(nearby_points, axis=0)
+
+        return unique_points
 
     def detect_keypoints_and_save_pcd(self, images, ori_img,
             model_alike, pcd_path, output_path, img_output_path):
@@ -262,6 +329,10 @@ class SuperColorPCSampling(object):
             # print(f"before keypoints average: {keypoints_counts}")
             keypoints_all_images = self.remove_duplicates_ndarray(keypoints_all_images)
             print(f">>>> keypoints number: {np.array(keypoints_all_images).shape}")
+            
+            keypoints_all_images = self.get_nearby_points_efficient(np.array(keypoints_all_images))
+            print(f">>>>22222222 keypoints number: {np.array(keypoints_all_images).shape}")
+            
 
 
             # # 打印关键点的平均数
@@ -306,6 +377,43 @@ class SuperColorPCSampling(object):
             keypoint_cloud.points = o3d.utility.Vector3dVector(keypoint_area_pcds)
             o3d.io.write_point_cloud(output_path, keypoint_cloud)
 
+
+
+    def detect_keypoints_and_save_pcd_SP(self, images, ori_img,
+            model_superpoint, pcd_path, output_path, img_output_path):
+            
+            colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255)]  # 不同的颜色对应不同的图片
+            keypoints_all_images = []
+            bg_img = copy.deepcopy(ori_img)
+
+            for img_res in images:
+                super_res = img_res[0]
+                img = copy.deepcopy(img_res[1])
+                tracker = img_res[2]
+                print(f"-------{super_res}-------")
+                out_keypoints = self.keypoint_extractor_SP(img, model_superpoint, tracker,  super_res=super_res,  bg_img=bg_img, colors=colors)
+                print(f"---- keypoints number: {np.array(out_keypoints).shape}")
+                keypoints_all_images.extend(out_keypoints)
+
+
+            # print(f"before keypoints average: {keypoints_counts}")
+            keypoints_all_images = self.remove_duplicates_ndarray(keypoints_all_images)
+            print(f">>>> keypoints number: {np.array(keypoints_all_images).shape}")
+
+            pcd = o3d.io.read_point_cloud(pcd_path)
+            points = np.asarray(pcd.points)
+            height, width = 128, 1024
+            data = points.reshape((height, width, -1))
+            
+            keypoint_area_pcds = []
+            for kpt in keypoints_all_images:
+                x, y = kpt
+                if 0 <= x  < width and 0 <= y  < height:
+                    keypoint_area_pcds.append(data[y , x ])
+
+            keypoint_cloud = o3d.geometry.PointCloud()
+            keypoint_cloud.points = o3d.utility.Vector3dVector(keypoint_area_pcds)
+            o3d.io.write_point_cloud(output_path, keypoint_cloud)
 
     def run(self):
         for i in range(2376):  # 假设ID从0到1463
